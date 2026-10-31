@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 class CAREAgent(BaseAgent):
     """CARE Agent wrapping underlying LLM with 7-layer resilience orchestration."""
+    
 
     def __init__(
         self,
@@ -79,7 +80,8 @@ class CAREAgent(BaseAgent):
         enable_care_recovery: bool = True,
         sov: Optional[Any] = None,
         tools_dir: Optional[str] = None,
-        telemetry_recorder: Optional[Any] = None
+        telemetry_recorder: Optional[Any] = None,
+        
     ):
         self.telemetry_recorder = telemetry_recorder
         # 1. Base Agent (Delegate LLM)
@@ -99,6 +101,8 @@ class CAREAgent(BaseAgent):
         self.enable_sov = enable_sov
         self.enable_care_recovery = enable_care_recovery
         self.execution_id = str(uuid.uuid4())
+
+        self.task_template = {}
 
         # 2. Layer 1: Semantic Output Validation Pipeline
         if sov is not None:
@@ -158,6 +162,13 @@ class CAREAgent(BaseAgent):
         self.last_recovery_directive: Optional[str] = None
         self.recovery_prompts_injected: int = 0
         self.force_abort: bool = False
+
+        def set_task_template(self, template):
+                """Store the original task template for runtime dependency analysis."""
+                self.task_template = template or {}
+                self.prerequisite_checker = PrerequisiteChecker(
+                    self.task_template
+            )
 
     def initialize(
     self,
