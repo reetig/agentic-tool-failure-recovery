@@ -6,21 +6,60 @@ class PrerequisiteChecker:
     """
     Checks whether a requested tool is eligible for execution
     according to the task's declared valid execution paths.
+
+    Supports:
+    - C1: execution_trace
+    - C2-C4: valid_paths
     """
 
     def __init__(self, task_json: Dict[str, Any]):
-        self.task_json = task_json if isinstance(task_json, dict) else {}
+        self.task_json = task_json or {}
 
-        raw_paths = self.task_json.get("valid_paths", [])
+        task_definition = self.task_json.get("task_definition") or {}
 
-        # Ignore malformed path entries.
-        self.valid_paths = [
-            path
-            for path in raw_paths
-            if isinstance(path, dict)
-            and isinstance(path.get("tools"), list)
-            and all(isinstance(tool, str) and tool for tool in path["tools"])
-        ] if isinstance(raw_paths, list) else []
+        # C2-C4: Read valid paths from the runtime task payload.
+        raw_paths = (
+            self.task_json.get("valid_paths")
+            or task_definition.get("valid_paths")
+            or []
+        )
+
+        self.valid_paths = []
+
+        for path in raw_paths:
+            if isinstance(path, dict):
+                tools = path.get("tools", [])
+            elif isinstance(path, list):
+                tools = path
+            else:
+                continue
+
+            if tools:
+                self.valid_paths.append({"tools": tools})
+
+        # C1: Fall back to the runtime execution sequence.
+        if not self.valid_paths:
+            trace = (
+                self.task_json.get("execution_trace")
+                or task_definition.get("execution_trace")
+                or []
+            )
+
+            trace_tools = []
+
+            for step in trace:
+                if isinstance(step, dict):
+                    tool_name = step.get("tool_name")
+                elif isinstance(step, str):
+                    tool_name = step
+                else:
+                    tool_name = None
+
+                if tool_name:
+                    trace_tools.append(tool_name)
+
+            if trace_tools:
+                self.valid_paths.append({"tools": trace_tools})
 
     def check(
         self,

@@ -21,6 +21,8 @@ from typing import Dict, Any, Optional, List, Set
 
 from .base_agent import BaseAgent, AgentAction, TokenUsage, ToolCall
 from dag_rerouting.prerequisite_checker import PrerequisiteChecker
+from dag_rerouting.execution_controller import ExecutionController
+
 
 try:
     from .openai_agent import OpenAIAgent
@@ -101,8 +103,10 @@ class CAREAgent(BaseAgent):
         self.enable_sov = enable_sov
         self.enable_care_recovery = enable_care_recovery
         self.execution_id = str(uuid.uuid4())
-
+        self.execution_controller = None
         self.task_template = {}
+        self.pending_action = None
+        self.pending_prerequisite = None
 
         # 2. Layer 1: Semantic Output Validation Pipeline
         if sov is not None:
@@ -163,12 +167,6 @@ class CAREAgent(BaseAgent):
         self.recovery_prompts_injected: int = 0
         self.force_abort: bool = False
 
-        def set_task_template(self, template):
-                """Store the original task template for runtime dependency analysis."""
-                self.task_template = template or {}
-                self.prerequisite_checker = PrerequisiteChecker(
-                    self.task_template
-            )
 
     def initialize(
     self,
@@ -185,6 +183,7 @@ class CAREAgent(BaseAgent):
         self.prerequisite_checker = PrerequisiteChecker(self.task_json)
         self.tool_definitions = tool_definitions
         self.execution_id = str(uuid.uuid4())
+        self.execution_controller = ExecutionController(self.task_json)
         task_id = self.task_json.get("task_id", "task_care")
         if self.sov is not None:
             try:
@@ -194,6 +193,8 @@ class CAREAgent(BaseAgent):
 
         self.step_counter = 0
         self.last_action = None
+        self.pending_action = None
+        self.pending_prerequisite = None
         self.last_recovery_directive = None
         self.recovery_prompts_injected = 0
         self.force_abort = False
@@ -228,10 +229,23 @@ class CAREAgent(BaseAgent):
         """Set task telemetry recorder."""
         self.telemetry_recorder = recorder
 
-    def set_task_json(self, task_json: Dict[str, Any]) -> None:
-        """Set task specification for DAG-aware and recovery routing."""
+    def set_task_json(self, task_json):
         self.task_json = task_json or {}
+
+        self.prerequisite_checker = PrerequisiteChecker(
+            self.task_json
+        )
+
+        self.execution_controller = ExecutionController(
+            self.task_json
+        )
+
+    def set_task_template(self, template):
+        """Store task information used for runtime dependency analysis."""
+        self.task_template = template or {}
+        self.task_json = self.task_template
         self.prerequisite_checker = PrerequisiteChecker(self.task_json)
+        self.execution_controller = ExecutionController(self.task_json)
 
     def _find_tool_definition(self, tool_name: str) -> Optional[Dict[str, Any]]:
         if not self.tool_definitions:
@@ -264,66 +278,193 @@ class CAREAgent(BaseAgent):
         return True
 
     def step(self, user_message: Optional[str] = None) -> AgentAction:
-        """Execute one reasoning step with proactive loop & abort guards."""
+        """Execute one reasoning step with prerequisite and blacklist guards."""
         self.step_counter += 1
 
-        # Early exit if recovery engine aborted
         if self.force_abort:
-            logger.info("CARE Guard: Force abort active. Delivering best synthesis.")
+            logger.info(
+                "CARE Guard: Force abort active. Delivering best synthesis."
+            )
             return AgentAction(
                 type="final_answer",
-                content="[CARE ABORT]: Recovery budget exhausted or all valid paths blocked. Finalizing task with best verified observations."
+                content=(
+                    "[CARE ABORT]: Recovery budget exhausted or all valid "
+                    "paths blocked. Finalizing task with best verified observations."
+                ),
             )
 
-        # Invoke base agent for next action
         action = self.base_agent.step(user_message=user_message)
+
+        # Enforce prerequisites declared in the runtime task payload.
+        if (
+            action.type == "tool_call"
+            and action.tool_name
+            and self.prerequisite_checker is not None
+        ):
+            executed_tools = self.tool_memory.get_executed_tools()
+            check = self.prerequisite_checker.check(
+                requested_tool=action.tool_name,
+                executed_tools=set(executed_tools),
+            )
+
+            if not check["allowed"]:
+                missing = check.get("missing_prerequisites", [])
+
+                if missing:
+                    required_tool = missing[0]
+                    original_tool = action.tool_name
+
+                    logger.info(
+                        "CARE Scheduler: '%s' requested before prerequisite "
+                        "'%s'. Asking the LLM to execute the prerequisite.",
+                        original_tool,
+                        required_tool,
+                    )
+
+                    self.pending_action = action
+                    self.pending_prerequisite = required_tool
+
+                    scheduling_prompt = (
+                        f"The requested tool '{original_tool}' cannot execute "
+                        f"yet. First call the prerequisite tool '{required_tool}'. "
+                        "Use the task description, available tool schema, and "
+                        "existing conversation/tool outputs to construct its "
+                        "arguments. Do not invent argument values. Call only "
+                        f"'{required_tool}' now. After its result is received, "
+                        "continue with the original task."
+                    )
+
+                    # OpenAIAgent.step() appends its assistant response to
+                    # the conversation before returning. The downstream tool
+                    # call has not executed yet, so remove that unfulfilled
+                    # assistant tool-call message before requesting a
+                    # prerequisite. This keeps the API message sequence valid.
+                    messages = getattr(self.base_agent, "messages", None)
+                    if (
+                        not isinstance(messages, list)
+                        or not messages
+                        or not isinstance(messages[-1], dict)
+                        or messages[-1].get("role") != "assistant"
+                        or not messages[-1].get("tool_calls")
+                    ):
+                        logger.error(
+                            "CARE Scheduler: Cannot safely roll back the "
+                            "premature tool call in the base-agent history."
+                        )
+                        self.pending_action = None
+                        self.pending_prerequisite = None
+                        return AgentAction(
+                            type="final_answer",
+                            content=(
+                                "CARE could not safely schedule the required "
+                                f"prerequisite tool: {required_tool}."
+                            ),
+                        )
+
+                    messages.pop()
+
+                    action = self.base_agent.step(
+                        user_message=scheduling_prompt
+                    )
+
+                    if (
+                        action.type != "tool_call"
+                        or action.tool_name != required_tool
+                    ):
+                        logger.error(
+                            "CARE Scheduler: Expected prerequisite '%s', "
+                            "but the LLM returned action type '%s' and tool '%s'.",
+                            required_tool,
+                            action.type,
+                            action.tool_name,
+                        )
+                        self.pending_action = None
+                        self.pending_prerequisite = None
+                        return AgentAction(
+                            type="final_answer",
+                            content=(
+                                "CARE could not safely schedule the required "
+                                f"prerequisite tool: {required_tool}."
+                            ),
+                        )
+
         self.last_action = action
 
-        # Guard: Check if agent is attempting to call a blacklisted tool
+        # Preserve the existing blacklist interception and DAG rerouting.
         if action.type == "tool_call" and action.tool_name:
             if self.health_registry.is_blacklisted(action.tool_name):
-                logger.warning(f"CARE Guard: Agent attempted to invoke blacklisted tool '{action.tool_name}'. Intercepting.")
+                logger.warning(
+                    "CARE Guard: Agent attempted to invoke blacklisted tool "
+                    "'%s'. Intercepting.",
+                    action.tool_name,
+                )
                 candidate = self.path_selector.find_reroute(
                     failed_tool=action.tool_name,
                     task_json=self.task_json,
                     blacklisted_tools=self.health_registry.get_blacklisted_tools(),
                     executed_tools=self.tool_memory.get_executed_tools(),
-                    available_outputs=self.tool_memory.get_available_outputs()
+                    available_outputs=self.tool_memory.get_available_outputs(),
                 )
+
                 if self.telemetry_recorder:
                     try:
                         self.telemetry_recorder.record_dag_path_selection(
                             failed_tool=action.tool_name,
-                            candidate_tools=getattr(candidate, "candidate_tools", []),
-                            selected_tool=getattr(candidate, "selected_tool", None),
+                            candidate_tools=getattr(
+                                candidate, "candidate_tools", []
+                            ),
+                            selected_tool=getattr(
+                                candidate, "selected_tool", None
+                            ),
                             is_viable=getattr(candidate, "is_viable", False),
-                            reason=getattr(candidate, "reason", "Blacklist guard interception"),
-                            target_path=getattr(candidate, "target_path", None)
+                            reason=getattr(
+                                candidate,
+                                "reason",
+                                "Blacklist guard interception",
+                            ),
+                            target_path=getattr(candidate, "target_path", None),
                         )
                     except Exception:
                         pass
+
                 if candidate.is_viable and candidate.selected_tool:
                     original_tool = action.tool_name
                     replacement_tool = candidate.selected_tool
-                    if self._are_tool_args_compatible(replacement_tool, action.arguments or {}):
+
+                    if self._are_tool_args_compatible(
+                        replacement_tool, action.arguments or {}
+                    ):
                         logger.info(
-                            f"CARE Reroute: Substituting blacklisted "
-                            f"'{original_tool}' with '{replacement_tool}'."
+                            "CARE Reroute: Substituting blacklisted '%s' "
+                            "with '%s'.",
+                            original_tool,
+                            replacement_tool,
                         )
                         action.tool_name = replacement_tool
                     else:
                         logger.warning(
-                            f"CARE Reroute: Candidate '{replacement_tool}' requires arguments "
-                            f"not present in '{original_tool}' call. Bypassing silent substitution."
+                            "CARE Reroute: Candidate '%s' requires arguments "
+                            "not present in '%s' call. Bypassing silent substitution.",
+                            replacement_tool,
+                            original_tool,
                         )
 
+        self.last_action = action
         return action
 
     def receive_tool_result(self, tool_name: str, result: Dict[str, Any], tool_call_index: int = 0) -> None:
         """Process tool results through the 7-layer validation and recovery pipeline."""
         
 
-        tool_args = (self.last_action.arguments if self.last_action and self.last_action.tool_name == tool_name else {})
+        if self.pending_prerequisite == tool_name:
+            self.pending_action = None
+            self.pending_prerequisite = None
+
+        tool_args = (
+            self.last_action.arguments
+            if self.last_action and self.last_action.tool_name == tool_name
+            else {}
+        )
         query = self.task_json.get("task_description", "")
 
         # ----------------------------------------------------
@@ -453,7 +594,7 @@ class CAREAgent(BaseAgent):
                  step_num=self.step_counter,
                  task_json=self.task_json,
                  tool_output=result,
-                 vailable_outputs=self.tool_memory.get_available_outputs()
+                 available_outputs=self.tool_memory.get_available_outputs()
                 )
                 self.budget_tracker.record_step_completed()
                 self.base_agent.receive_tool_result(tool_name, result, tool_call_index)
@@ -542,4 +683,6 @@ class CAREAgent(BaseAgent):
         self.step_counter = 0
         self.force_abort = False
         self.last_action = None
+        self.pending_action = None
+        self.pending_prerequisite = None
         self.last_recovery_directive = None
